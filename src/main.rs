@@ -124,6 +124,8 @@ struct State {
     ascii: bool,
     wide: bool,
     dest_hop: Option<usize>,
+    /// `d` modal contents; None = closed.
+    details: Option<Vec<(&'static str, String)>>,
 }
 
 /// Hop probes carry this bit in their ICMP seq so replies can't be confused with the target probe.
@@ -255,22 +257,262 @@ fn sock_addr(ip: Ipv4Addr) -> libc::sockaddr_in {
 }
 
 fn bind_iface(fd: RawFd, name: &str) {
-    match std::ffi::CString::new(name) {
-        Ok(dev) => unsafe {
-            if libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_BINDTODEVICE,
-                dev.as_ptr() as *const _,
-                dev.as_bytes().len() as libc::socklen_t,
-            ) < 0
-            {
-                let e = std::io::Error::last_os_error();
-                die(&format!("bind to {name} failed: {e}"));
-            }
-        },
-        Err(_) => die("bad interface name"),
+    if let Err(e) = set_iface(fd, name) {
+        die(&format!("bind to {name} failed: {e}"));
     }
+}
+
+/// SO_BINDTODEVICE; an empty name unbinds (back to the routing table).
+fn set_iface(fd: RawFd, name: &str) -> std::io::Result<()> {
+    let dev = std::ffi::CString::new(name)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            dev.as_ptr() as *const _,
+            dev.as_bytes().len() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Interfaces worth cycling through: up, not loopback, not Docker bridges/veths.
+fn list_ifaces() -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir("/sys/class/net")
+        .map(|rd| {
+            rd.filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| {
+                    n != "lo" && !["veth", "br-", "docker"].iter().any(|p| n.starts_with(p))
+                })
+                .filter(|n| {
+                    std::fs::read_to_string(format!("/sys/class/net/{n}/operstate"))
+                        .is_ok_and(|s| s.trim() != "down")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// Cycle order: default route, then each interface, then back to default.
+fn next_iface(list: &[String], cur: Option<&str>) -> Option<String> {
+    match cur.and_then(|c| list.iter().position(|n| n == c)) {
+        Some(i) => list.get(i + 1).cloned(),
+        None => list.first().cloned(),
+    }
+}
+
+fn reset_stats(st: &mut State) {
+    let n = st.hops.len();
+    st.hops = (0..n).map(|_| Hop::default()).collect();
+    st.sent = 0;
+    st.rcvd = 0;
+    st.min_r = None;
+    st.max_r = None;
+    st.last_r = None;
+    st.sum = 0;
+    st.jitter = 0.0;
+    st.jit_n = 0;
+    st.chart.clear();
+    st.log.clear();
+    st.round = None;
+    st.dest_hop = None;
+}
+
+/// `i` key: let in-flight replies land, then swap to a fresh socket bound to the
+/// next interface and start clean. A new socket because the kernel only lets an
+/// unprivileged socket set SO_BINDTODEVICE once (rebind/unbind needs CAP_NET_RAW).
+/// Any failure keeps the old socket and interface (the stats bar still names it).
+fn switch_iface(st: &mut State, fd: &mut RawFd) {
+    let next = next_iface(&list_ifaces(), st.cfg.iface.as_deref());
+    drain(st, *fd, &mut [0u8; 16384], 300);
+    let kind = if st.ping_mode {
+        libc::SOCK_DGRAM
+    } else {
+        libc::SOCK_RAW
+    };
+    let new = unsafe { libc::socket(2, kind as _, 1) };
+    if new < 0 {
+        return;
+    }
+    let bound = next.as_deref().is_none_or(|n| set_iface(new, n).is_ok());
+    if !bound || (st.ping_mode && !enable_recverr(new)) {
+        unsafe { libc::close(new) };
+        return;
+    }
+    unsafe { libc::close(*fd) };
+    *fd = new;
+    st.cfg.iface = next;
+    reset_stats(st);
+    if st.details.is_some() {
+        st.details = Some(iface_details(st));
+    }
+}
+
+/// Run a command for its stdout; empty on any failure (missing tool, non-zero exit).
+fn run(cmd: &str, args: &[&str]) -> String {
+    std::process::Command::new(cmd)
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+fn prefix_mask(p: u8) -> Ipv4Addr {
+    Ipv4Addr::from(u32::MAX.checked_shl(32 - p.min(32) as u32).unwrap_or(0))
+}
+
+/// `ip -o -4 addr show dev X`: first address + prefix, and whether it is a DHCP lease.
+fn parse_addr(t: &str) -> (Option<(String, u8)>, bool) {
+    let line = t.lines().next().unwrap_or("");
+    let cidr = word_after(line, "inet").and_then(|c| {
+        let (ip, p) = c.split_once('/')?;
+        Some((ip.to_string(), p.parse().ok()?))
+    });
+    (cidr, line.split_whitespace().any(|w| w == "dynamic"))
+}
+
+/// The word following `key` in iproute2 output ("via 10.0.0.1", "dev eth0").
+fn word_after(t: &str, key: &str) -> Option<String> {
+    let mut it = t.split_whitespace();
+    it.find(|w| *w == key)?;
+    it.next().map(str::to_string)
+}
+
+/// `ip -d link show dev X`: (parent, vlan id) when the host itself tags the traffic.
+fn parse_vlan(t: &str) -> Option<(String, u16)> {
+    let id = t
+        .lines()
+        .find(|l| l.trim_start().starts_with("vlan protocol"))
+        .and_then(|l| word_after(l, "id"))?
+        .parse()
+        .ok()?;
+    let name = t.split_whitespace().nth(1)?.trim_end_matches(':');
+    let parent = name.split_once('@').map_or("?", |(_, p)| p);
+    Some((parent.to_string(), id))
+}
+
+/// DHCP server from a systemd-networkd lease (SERVER_ADDRESS=) or a dhclient
+/// lease (dhcp-server-identifier); the last one wins, as dhclient appends.
+fn lease_server(t: &str) -> Option<String> {
+    t.lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("SERVER_ADDRESS=")
+                .or_else(|| l.strip_prefix("option dhcp-server-identifier "))
+                .map(|v| v.trim_end_matches(';').to_string())
+        })
+        .next_back()
+}
+
+/// `resolvectl dns X`: "Link 3 (eth0): 10.0.0.1 1.1.1.1".
+fn parse_resolvectl(t: &str) -> Option<String> {
+    let v = t.lines().next()?.split_once("): ")?.1.trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+fn dhcp_server(dev: &str) -> Option<String> {
+    let idx = std::fs::read_to_string(format!("/sys/class/net/{dev}/ifindex")).ok()?;
+    if let Ok(t) = std::fs::read_to_string(format!("/run/systemd/netif/leases/{}", idx.trim())) {
+        return lease_server(&t);
+    }
+    std::fs::read_dir("/var/lib/dhcp")
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.contains(dev) && n.ends_with(".leases")
+        })
+        .find_map(|e| lease_server(&std::fs::read_to_string(e.path()).ok()?))
+}
+
+/// Snapshot for the `d` modal. Unbound, it describes the interface the kernel
+/// would route the target through.
+fn iface_details(st: &State) -> Vec<(&'static str, String)> {
+    let target = st.dest.to_string();
+    let bound = st.cfg.iface.is_some();
+    let Some(dev) = st
+        .cfg
+        .iface
+        .clone()
+        .or_else(|| word_after(&run("ip", &["-4", "route", "get", &target]), "dev"))
+    else {
+        return vec![("Interface", "no route to target".into())];
+    };
+    let (cidr, dynamic) = parse_addr(&run("ip", &["-o", "-4", "addr", "show", "dev", &dev]));
+    let unknown = || "unknown".to_string();
+    let dns = parse_resolvectl(&run("resolvectl", &["dns", &dev])).unwrap_or_else(|| {
+        let ns: Vec<String> = std::fs::read_to_string("/etc/resolv.conf")
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.strip_prefix("nameserver ").map(|v| v.trim().to_string()))
+            .collect();
+        if ns.is_empty() {
+            unknown()
+        } else {
+            format!("{} (resolv.conf)", ns.join(" "))
+        }
+    });
+    vec![
+        (
+            "Interface",
+            format!(
+                "{dev} ({})",
+                if bound { "selected" } else { "default route" }
+            ),
+        ),
+        (
+            "IP address",
+            cidr.as_ref()
+                .map_or("none (IPv4)".into(), |(ip, p)| format!("{ip}/{p}")),
+        ),
+        (
+            "Subnet mask",
+            cidr.as_ref()
+                .map_or("-".into(), |(_, p)| prefix_mask(*p).to_string()),
+        ),
+        (
+            "Gateway",
+            word_after(
+                &run("ip", &["-4", "route", "show", "default", "dev", &dev]),
+                "via",
+            )
+            .unwrap_or_else(|| "none on this interface".into()),
+        ),
+        (
+            "Default route",
+            run("ip", &["-4", "route", "show", "default"])
+                .lines()
+                .next()
+                .map_or("none".into(), |l| l.trim().to_string()),
+        ),
+        (
+            "VLAN",
+            parse_vlan(&run("ip", &["-d", "link", "show", "dev", &dev]))
+                .map_or("untagged on this host".into(), |(parent, id)| {
+                    format!("id {id} on {parent} (name: {dev})")
+                }),
+        ),
+        ("DNS servers", dns),
+        ("Addressing", if dynamic { "DHCP" } else { "static" }.into()),
+        (
+            "DHCP server",
+            if dynamic {
+                dhcp_server(&dev).unwrap_or_else(unknown)
+            } else {
+                "-".into()
+            },
+        ),
+    ]
 }
 
 fn open_icmp(iface: &Option<String>) -> (RawFd, bool) {
@@ -289,7 +531,7 @@ fn open_icmp(iface: &Option<String>) -> (RawFd, bool) {
             }
             _ => {}
         }
-        die(&"no ICMP socket privilege");
+        no_icmp_privilege();
     }
     let mut fd = unsafe { libc::socket(2, libc::SOCK_DGRAM as _, 1) };
     if fd >= 0 {
@@ -299,7 +541,19 @@ fn open_icmp(iface: &Option<String>) -> (RawFd, bool) {
     if fd >= 0 {
         return (fd, false);
     }
-    die(&"no ICMP socket privilege: run `sudo sysctl -w net.ipv4.ping_group_range='1 65534'` or `sudo setcap cap_net_raw+ep $(which pingr)`");
+    no_icmp_privilege();
+}
+
+/// Neither socket type opened: say why, with the numbers the kernel checked.
+fn no_icmp_privilege() -> ! {
+    let range = std::fs::read_to_string("/proc/sys/net/ipv4/ping_group_range")
+        .map(|r| r.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_else(|_| "unknown".into());
+    let gid = unsafe { libc::getgid() };
+    die(&format!(
+        "no ICMP socket privilege: your group id {gid} is outside net.ipv4.ping_group_range ({range}) and the binary lacks CAP_NET_RAW.\n\
+         fix: `sudo sysctl -w net.ipv4.ping_group_range='0 2147483647'` or `sudo setcap cap_net_raw+ep $(which pingr)`"
+    ));
 }
 
 fn set_ttl(fd: RawFd, ttl: u8) -> bool {
@@ -338,7 +592,9 @@ fn recv_pkt(fd: RawFd, buf: &mut [u8]) -> Option<(usize, Ipv4Addr)> {
             fd,
             buf.as_mut_ptr() as *mut _,
             buf.len(),
-            0,
+            // non-blocking: a failed send (EHOSTUNREACH) makes select report
+            // readable with no packet queued, and a blocking recv hangs forever
+            libc::MSG_DONTWAIT,
             &mut a as *mut _ as *mut libc::sockaddr,
             &mut l,
         );
@@ -794,9 +1050,14 @@ fn draw<B: ratatui::backend::Backend>(t: &mut Terminal<B>, st: &State) {
             } else {
                 "-".into()
             };
+            let via = st
+                .cfg
+                .iface
+                .as_deref()
+                .map_or(String::new(), |i| format!(" via {i}"));
             let stats = format!(
-                "pingr {}  sent={} rcvd={} loss={} min={} max={} avg={} jitter={}",
-                st.dest_name, st.sent, st.rcvd, loss_s, min_s, max_s, avg_s, jit_s
+                "pingr {}{}  sent={} rcvd={} loss={} min={} max={} avg={} jitter={}",
+                st.dest_name, via, st.sent, st.rcvd, loss_s, min_s, max_s, avg_s, jit_s
             );
             f.render_widget(
                 Paragraph::new(Text::from(stats)).block(
@@ -809,9 +1070,9 @@ fn draw<B: ratatui::backend::Backend>(t: &mut Terminal<B>, st: &State) {
                         ]))
                         .title(
                             Line::from(if st.cfg.trace {
-                                " q quit  c clear  f columns "
+                                " q quit  c clear  i iface  d details  f columns "
                             } else {
-                                " q quit  c clear "
+                                " q quit  c clear  i iface  d details "
                             })
                             .right_aligned(),
                         ),
@@ -930,6 +1191,40 @@ fn draw<B: ratatui::backend::Backend>(t: &mut Terminal<B>, st: &State) {
                 ),
                 chunks[3],
             );
+
+            if let Some(d) = &st.details {
+                let area = f.area();
+                // key column 15 + borders 2 + a space; never wider than the screen
+                let longest = d.iter().map(|(_, v)| v.chars().count()).max().unwrap_or(0);
+                let w = (longest as u16 + 18).max(40).min(area.width);
+                let h = (d.len() as u16 + 2).min(area.height);
+                let r = ratatui::layout::Rect::new(
+                    area.x + (area.width - w) / 2,
+                    area.y + (area.height - h) / 2,
+                    w,
+                    h,
+                );
+                let lines: Vec<Line> = d
+                    .iter()
+                    .map(|(k, v)| {
+                        Line::from(vec![
+                            Span::styled(format!(" {k:<14}"), Style::default().fg(Color::Yellow)),
+                            Span::raw(v.clone()),
+                        ])
+                    })
+                    .collect();
+                f.render_widget(Clear, r);
+                f.render_widget(
+                    Paragraph::new(lines).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Color::Cyan)
+                            .title(" Interface details ")
+                            .title(Line::from(" d / Esc close ").right_aligned()),
+                    ),
+                    r,
+                );
+            }
         })
         .is_err();
 }
@@ -937,7 +1232,7 @@ fn draw<B: ratatui::backend::Backend>(t: &mut Terminal<B>, st: &State) {
 fn main() {
     let cfg = Cli::parse();
     let (dest, name) = resolve_target(&cfg.target);
-    let (fd, ping_mode) = open_icmp(&cfg.iface);
+    let (mut fd, ping_mode) = open_icmp(&cfg.iface);
     if !ping_mode {
         eprintln!("pingr: using raw socket (root/cap mode)");
     } else if !enable_recverr(fd) {
@@ -971,6 +1266,7 @@ fn main() {
         ascii: cfg.ascii || std::env::var_os("NO_COLOR").is_some(),
         wide: false,
         dest_hop: None,
+        details: None,
     };
 
     if cfg.quiet {
@@ -1014,12 +1310,25 @@ fn main() {
             if let Ok(e) = crossterm::event::read() {
                 match e {
                     Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                        KeyCode::Esc | KeyCode::Char('d') if st.details.is_some() => {
+                            st.details = None;
+                            draw(&mut term, &st);
+                        }
+                        KeyCode::Char('d') => {
+                            st.details = Some(iface_details(&st));
+                            draw(&mut term, &st);
+                        }
                         KeyCode::Char('q') | KeyCode::Esc => quit = true,
                         KeyCode::Char('c') => {
                             st.chart.clear();
                             cleared = true;
                         }
                         KeyCode::Char('f') if st.cfg.trace => st.wide = !st.wide,
+                        KeyCode::Char('i') => {
+                            switch_iface(&mut st, &mut fd);
+                            next_round = Instant::now();
+                            cleared = true;
+                        }
                         _ => {}
                     },
                     _ => {}
@@ -1047,6 +1356,14 @@ fn main() {
                     if let Ok(e) = crossterm::event::read() {
                         match e {
                             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                                KeyCode::Esc | KeyCode::Char('d') if st.details.is_some() => {
+                                    st.details = None;
+                                    cleared = true;
+                                }
+                                KeyCode::Char('d') => {
+                                    st.details = Some(iface_details(&st));
+                                    cleared = true;
+                                }
                                 KeyCode::Char('q') | KeyCode::Esc => {
                                     quit = true;
                                     break;
@@ -1055,6 +1372,10 @@ fn main() {
                                     st.chart.clear();
                                 }
                                 KeyCode::Char('f') if st.cfg.trace => st.wide = !st.wide,
+                                KeyCode::Char('i') => {
+                                    switch_iface(&mut st, &mut fd);
+                                    break;
+                                }
                                 _ => {}
                             },
                             _ => {}
@@ -1131,6 +1452,7 @@ mod tests {
             ascii: false,
             wide: false,
             dest_hop: None,
+            details: None,
         };
         let r = Round {
             seq: 0,
@@ -1199,6 +1521,7 @@ mod tests {
             ascii: false,
             wide: false,
             dest_hop: None,
+            details: None,
         }
     }
 
@@ -1447,5 +1770,83 @@ mod tests {
         assert!(spark_spans(&[1, 50], true)
             .iter()
             .all(|s| s.style.fg == Some(Color::Reset)));
+    }
+
+    #[test]
+    fn iface_cycle_wraps_through_default() {
+        let l: Vec<String> = vec!["eno1".into(), "wg0".into()];
+        assert_eq!(next_iface(&l, None), Some("eno1".into()));
+        assert_eq!(next_iface(&l, Some("eno1")), Some("wg0".into()));
+        assert_eq!(next_iface(&l, Some("wg0")), None);
+        assert_eq!(next_iface(&l, Some("gone0")), Some("eno1".into()));
+        assert_eq!(next_iface(&[], None), None);
+    }
+
+    #[test]
+    fn reset_clears_stats_and_shows_iface() {
+        let mut st = test_state(3, true);
+        reply_after(&mut st, 0, 5);
+        st.hops[0].sent = 4;
+        st.dest_hop = Some(1);
+        st.cfg.iface = Some("wg0".into());
+        reset_stats(&mut st);
+        assert_eq!((st.sent, st.rcvd, st.sum, st.jit_n), (0, 0, 0, 0));
+        assert!(st.min_r.is_none() && st.last_r.is_none() && st.dest_hop.is_none());
+        assert!(st.chart.is_empty() && st.log.is_empty() && st.round.is_none());
+        assert_eq!(st.hops.len(), 3);
+        assert_eq!(st.hops[0].sent, 0);
+        let top = screen(&st, 100, 40).concat();
+        assert!(top.contains("via wg0"), "iface missing from stats bar");
+        assert!(top.contains("i iface"), "key hint missing");
+    }
+
+    #[test]
+    fn iface_detail_parsers() {
+        assert_eq!(prefix_mask(27), Ipv4Addr::new(255, 255, 255, 224));
+        assert_eq!(prefix_mask(0), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(prefix_mask(32), Ipv4Addr::BROADCAST);
+
+        let a = "3: eth0    inet 192.0.2.9/27 metric 100 brd 192.0.2.31 scope global dynamic eth0\\       valid_lft 74187sec";
+        assert_eq!(parse_addr(a), (Some(("192.0.2.9".into(), 27)), true));
+        let st = "2: eth0    inet 192.168.1.5/24 brd 192.168.1.255 scope global eth0";
+        assert_eq!(parse_addr(st), (Some(("192.168.1.5".into(), 24)), false));
+        assert_eq!(parse_addr(""), (None, false));
+
+        let get = "1.1.1.1 via 192.0.2.1 dev eth0 src 192.0.2.9 uid 1000 \n    cache";
+        assert_eq!(word_after(get, "dev").as_deref(), Some("eth0"));
+        assert_eq!(word_after(get, "via").as_deref(), Some("192.0.2.1"));
+
+        let link = "5: eth0.10@eth0: <BROADCAST,UP> mtu 1500\n    link/ether aa:bb brd ff:ff\n    vlan protocol 802.1Q id 10 <REORDER_HDR>";
+        assert_eq!(parse_vlan(link), Some(("eth0".into(), 10)));
+        assert_eq!(parse_vlan("3: eth0: <UP> mtu 1500"), None);
+
+        assert_eq!(
+            lease_server("ADDRESS=192.0.2.9\nSERVER_ADDRESS=192.0.2.1\n").as_deref(),
+            Some("192.0.2.1")
+        );
+        assert_eq!(
+            lease_server("  option dhcp-server-identifier 192.168.1.1;\n").as_deref(),
+            Some("192.168.1.1")
+        );
+        assert_eq!(lease_server("nothing"), None);
+
+        assert_eq!(
+            parse_resolvectl("Link 3 (eth0): 192.0.2.1 1.1.1.1\n").as_deref(),
+            Some("192.0.2.1 1.1.1.1")
+        );
+        assert_eq!(parse_resolvectl("Link 3 (eth0):\n"), None);
+    }
+
+    #[test]
+    fn details_modal_renders_over_tui() {
+        let mut st = test_state(1, false);
+        st.details = Some(vec![
+            ("Interface", "eth0.10".into()),
+            ("Gateway", "192.168.1.1".into()),
+        ]);
+        let txt = screen(&st, 100, 40).concat();
+        assert!(txt.contains("Interface details"));
+        assert!(txt.contains("192.168.1.1"));
+        assert!(txt.contains("d / Esc close"));
     }
 }

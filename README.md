@@ -8,10 +8,15 @@
   avg, best, worst, stdev, EMA and a coloured latency bar per hop). Probing stops
   at the destination, so you do not get 30 rows of nothing.
 
-Single binary, IPv4 only, Linux only. No root needed once unprivileged ICMP is
-enabled (see below).
+Single binary, IPv4 only, Linux only. No root needed on most distros (see below).
 
 This is a fun side project, not a production tool.
+
+![Ping mode](docs/ping.png)
+
+![Trace mode](docs/trace.png)
+
+![Interface details](docs/details.png)
 
 ## Build
 
@@ -22,15 +27,27 @@ cargo build --release
 # binary: target/release/pingr
 ```
 
-## Unprivileged ICMP (one-time setup)
+## Unprivileged ICMP
 
-pingr opens an ICMP datagram socket, which Linux only allows for groups inside
-`net.ipv4.ping_group_range`. Many distros ship it disabled (`1 0`). Pick one:
+pingr opens an ICMP datagram ("ping") socket, which Linux only allows for groups
+inside `net.ipv4.ping_group_range`. The kernel default is `1 0` (nobody), but
+systemd 243+ sets `0 2147483647`, so most current distros (Ubuntu 20.04+, Fedora,
+Arch, Debian 11+) need no setup. This is not specific to trace mode; plain ping
+needs it too, as does the system `ping`.
+
+Check yours:
+
+```sh
+sysctl net.ipv4.ping_group_range
+```
+
+If pingr exits with "no ICMP socket privilege" (it prints your group id and the
+current range), pick one:
 
 ```sh
 # 1. allow everyone (persistent)
-sudo sysctl -w net.ipv4.ping_group_range="1 65534"
-echo 'net.ipv4.ping_group_range=1 65534' | sudo tee /etc/sysctl.d/99-ping.conf
+sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+echo 'net.ipv4.ping_group_range=0 2147483647' | sudo tee /etc/sysctl.d/99-ping.conf
 
 # 2. or give just this binary raw-socket capability (redo after each rebuild)
 sudo setcap cap_net_raw+ep target/release/pingr
@@ -67,8 +84,17 @@ pingr -q --rounds 3 1.1.1.1         # quiet, 3 rounds, then exit
 pingr -s 128 -i 500 --ylim 50 host  # bigger payload, 500ms cadence, fixed scale
 ```
 
-Keys (shown in the top border): `q`/`Esc` quit, `c` clear chart, `f` toggle extra
-columns (trace mode).
+Keys (shown in the top border): `q`/`Esc` quit, `c` clear chart, `i` next interface
+(cycles the default route then each interface that is up; resets stats), `d` interface
+details, `f` toggle extra columns (trace mode).
+
+The `d` modal shows the interface in use (or the one the kernel routes the target
+through), its IPv4 address and subnet mask, gateway, default route, VLAN tag, DNS
+servers, and whether it is DHCP or static plus the DHCP server. It reads `ip`,
+`resolvectl` (falls back to `/etc/resolv.conf`) and systemd-networkd or dhclient
+lease files, so the DHCP server shows "unknown" under NetworkManager. The VLAN tag
+only shows when the host tags traffic itself (e.g. `eth0.10`); VLANs assigned on a
+switch access port are invisible to the host.
 
 ### Layout
 
