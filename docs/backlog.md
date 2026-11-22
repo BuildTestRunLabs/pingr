@@ -14,4 +14,20 @@ proposed 2026-11-22. Today pingr resolves the target, keeps only IPv4 addresses,
 - TUI: IPv6 addresses are up to 39 characters; check the hop table and stats bar widths, and add a TestBackend render test with a long address.
 - Out of scope unless asked: dual-stack side-by-side mode.
 
-Feasibility: moderate. Mostly parallel code paths for the socket, sockaddr, and error-queue parsing; the stats and TUI stay shared. Test on a host with working IPv6 (node1's IPv6 state needs checking first) and in WSL2, where IPv6 depends on the networking mode.
+Feasibility: moderate. Mostly parallel code paths for the socket, sockaddr, and error-queue parsing; the stats and TUI stay shared. Test on a host with working IPv6 (check the dev host's IPv6 state first) and in WSL2, where IPv6 depends on the networking mode.
+
+## B2. Fix `--report-on-exit` column layout
+
+found 2026-11-22 while testing the v0.1.1 release binary. Only affects the plain-text report printed after the TUI exits; the TUI itself is fine. Reproduces outside tmux, so it is in the code, not the terminal.
+
+```
+Snt  Loss%  Last  Avg  Best  Wrst  StDev  EMA
+   1    0%     0     0     0     0     0     0  192.0.2.1
+   2  ?   ?%   ?    ?    ?     ?     ?
+```
+
+- The header in `report_lines()` has no hop column, so the hop number sits under "Snt" and every label is one column off.
+- The sent count is never printed.
+- Silent hops use a separate, shorter `?` row that does not line up, while the TUI shows them as 100% loss with a sent count.
+
+Fix: add a `Hop` header, print `h.sent`, print silent hops as 100% loss with `-` for the timing columns using the same widths, and add a unit test on `report_lines()` output.
