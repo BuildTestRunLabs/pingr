@@ -4,6 +4,8 @@ on:
     tags: ["v*"]
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 jobs:
   build:
     strategy:
@@ -30,6 +32,9 @@ jobs:
           cp target/${{ matrix.target }}/release/pingr README.md LICENSE "$name"/
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: pingr-*.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
@@ -38,9 +43,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
-      - run: gh release create "$GITHUB_REF_NAME" pingr-*.tar.gz* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+      - run: |
+          sed "s/VERSION/$GITHUB_REF_NAME/" .github/release-notes.md > notes.md
+          gh release create "$GITHUB_REF_NAME" pingr-*.tar.gz* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes-file notes.md --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}

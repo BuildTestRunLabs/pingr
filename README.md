@@ -30,6 +30,7 @@ f=pingr-$v-$arch-unknown-linux-musl
 curl -LO https://github.com/BuildTestRunLabs/pingr/releases/download/$v/$f.tar.gz
 curl -LO https://github.com/BuildTestRunLabs/pingr/releases/download/$v/$f.tar.gz.sha256
 sha256sum -c $f.tar.gz.sha256
+gh attestation verify $f.tar.gz --repo BuildTestRunLabs/pingr   # optional, from v0.1.1
 tar xzf $f.tar.gz
 sudo install $f/pingr /usr/local/bin/
 ```
