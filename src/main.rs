@@ -122,6 +122,8 @@ struct State {
     dest_hop: Option<usize>,
     /// `d` modal contents; None = closed.
     details: Option<Vec<(&'static str, String)>>,
+    /// `p` key: no new rounds start while set.
+    paused: bool,
 }
 
 /// Hop probes carry this bit in their ICMP seq so replies can't be confused with the target probe.
@@ -1072,8 +1074,17 @@ fn draw<B: ratatui::backend::Backend>(t: &mut Terminal<B>, st: &State) {
                 .as_deref()
                 .map_or(String::new(), |i| format!(" via {i}"));
             let stats = format!(
-                "pingr {}{}  sent={} rcvd={} loss={} min={} max={} avg={} jitter={}",
-                st.dest_name, via, st.sent, st.rcvd, loss_s, min_s, max_s, avg_s, jit_s
+                "pingr {}{}  sent={} rcvd={} loss={} min={} max={} avg={} jitter={}{}",
+                st.dest_name,
+                via,
+                st.sent,
+                st.rcvd,
+                loss_s,
+                min_s,
+                max_s,
+                avg_s,
+                jit_s,
+                if st.paused { "  PAUSED" } else { "" }
             );
             f.render_widget(
                 Paragraph::new(Text::from(stats)).block(
@@ -1086,9 +1097,9 @@ fn draw<B: ratatui::backend::Backend>(t: &mut Terminal<B>, st: &State) {
                         ]))
                         .title(
                             Line::from(if st.cfg.trace {
-                                " q quit  c clear  i iface  d details  f columns "
+                                " q quit  p pause  c clear  i iface  d details  f columns "
                             } else {
-                                " q quit  c clear  i iface  d details "
+                                " q quit  p pause  c clear  i iface  d details "
                             })
                             .right_aligned(),
                         ),
@@ -1283,6 +1294,7 @@ fn main() {
         wide: false,
         dest_hop: None,
         details: None,
+        paused: false,
     };
 
     if cfg.quiet {
@@ -1334,6 +1346,11 @@ fn main() {
                             st.details = Some(iface_details(&st));
                             draw(&mut term, &st);
                         }
+                        KeyCode::Char('p') => {
+                            st.paused = !st.paused;
+                            next_round = Instant::now();
+                            draw(&mut term, &st);
+                        }
                         KeyCode::Char('q') | KeyCode::Esc => quit = true,
                         KeyCode::Char('c') => {
                             st.chart.clear();
@@ -1347,12 +1364,13 @@ fn main() {
                         }
                         _ => {}
                     },
+                    Event::Resize(..) => draw(&mut term, &st),
                     _ => {}
                 }
             }
         }
 
-        if !quit && Instant::now() >= next_round {
+        if !quit && !st.paused && Instant::now() >= next_round {
             start_round(&mut st, fd);
             let mut buf = [0u8; 16384];
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -1383,6 +1401,10 @@ fn main() {
                                 KeyCode::Char('q') | KeyCode::Esc => {
                                     quit = true;
                                     break;
+                                }
+                                KeyCode::Char('p') => {
+                                    st.paused = !st.paused;
+                                    cleared = true;
                                 }
                                 KeyCode::Char('c') => {
                                     st.chart.clear();
@@ -1469,6 +1491,7 @@ mod tests {
             wide: false,
             dest_hop: None,
             details: None,
+            paused: false,
         };
         let r = Round {
             seq: 0,
@@ -1538,6 +1561,7 @@ mod tests {
             wide: false,
             dest_hop: None,
             details: None,
+            paused: false,
         }
     }
 
@@ -1881,5 +1905,14 @@ mod tests {
         assert!(txt.contains("Interface details"));
         assert!(txt.contains("192.168.1.1"));
         assert!(txt.contains("d / Esc close"));
+    }
+
+    #[test]
+    fn pause_shows_in_stats_bar() {
+        let mut st = test_state(1, false);
+        assert!(!screen(&st, 100, 40).concat().contains("PAUSED"));
+        assert!(screen(&st, 100, 40)[0].contains("p pause"));
+        st.paused = true;
+        assert!(screen(&st, 100, 40)[1].contains("PAUSED"));
     }
 }

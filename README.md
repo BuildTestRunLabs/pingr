@@ -84,7 +84,7 @@ pingr -q --rounds 3 1.1.1.1         # quiet, 3 rounds, then exit
 pingr -s 128 -i 500 --ylim 50 host  # bigger payload, 500ms cadence, fixed scale
 ```
 
-Keys (shown in the top border): `q`/`Esc` quit, `c` clear chart, `i` next interface
+Keys (shown in the top border): `q`/`Esc` quit, `p` pause/resume probing, `c` clear chart, `i` next interface
 (cycles the default route then each interface that is up; resets stats), `d` interface
 details, `f` toggle extra columns (trace mode).
 
