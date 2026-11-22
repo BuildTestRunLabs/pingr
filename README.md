@@ -137,6 +137,17 @@ cargo clippy
 - Built with [ratatui](https://ratatui.rs), [crossterm](https://github.com/crossterm-rs/crossterm)
   and [clap](https://github.com/clap-rs/clap).
 
+## Reading the results
+
+New to ping and path tracing? Read [docs/reading-results.md](docs/reading-results.md).
+It explains why middle hops often show 100% loss (usually routers declining to
+answer, not a fault), what a real problem looks like, typical Australian
+latencies, thresholds for calls, gaming and streaming, and how wired, Wi-Fi,
+mobile and satellite connections differ.
+
+The short version: judge loss at the destination. Loss only matters when it
+starts at a hop and carries through to every hop after it.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).

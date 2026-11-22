@@ -74,21 +74,17 @@ struct Hop {
 impl Hop {
     fn st(&self) -> (u64, u64, u64, u32, u32) {
         let s = &self.samples;
+        let loss = (100 * self.sent.saturating_sub(self.rcvd) / self.sent.max(1)) as u32;
         if s.is_empty() {
-            return (0, 0, 0, 0, 0);
+            // no replies yet: timings are unknown, but every probe sent was lost
+            return (0, 0, 0, 0, loss);
         }
         let sum: u64 = s.iter().sum();
         let min = s.iter().min().copied().unwrap();
         let max = s.iter().max().copied().unwrap();
         let mean = sum as f64 / s.len() as f64;
         let var = s.iter().map(|x| (*x as f64 - mean).powi(2)).sum::<f64>() / s.len() as f64;
-        (
-            sum / s.len() as u64,
-            min,
-            max,
-            var.sqrt() as u32,
-            (100 * self.sent.saturating_sub(self.rcvd) / self.sent.max(1)) as u32,
-        )
+        (sum / s.len() as u64, min, max, var.sqrt() as u32, loss)
     }
 }
 
@@ -975,6 +971,14 @@ fn hop_cells(i: usize, h: &Hop, wide: bool, ascii: bool) -> Vec<(String, Option<
     let (avg, min, max, sd, loss) = h.st();
     let last = h.samples.last().copied().unwrap_or(0);
     let bad = (h.ip.is_some() && loss >= 100) || (h.ip.is_none() && h.sent > 0);
+    // no replies: show "-" rather than a fake 0ms
+    let ms = |v: u64| {
+        if h.samples.is_empty() {
+            "-".to_string()
+        } else {
+            format!("{v}ms")
+        }
+    };
     let mut c = vec![
         ((i + 1).to_string(), None),
         (
@@ -994,14 +998,26 @@ fn hop_cells(i: usize, h: &Hop, wide: bool, ascii: bool) -> Vec<(String, Option<
     if wide {
         c.push((h.rcvd.to_string(), None));
     }
-    c.push((format!("{last}ms"), grade_color(last, ascii)));
-    c.push((format!("{avg}ms"), None));
+    let last_col = if h.samples.is_empty() {
+        None
+    } else {
+        grade_color(last, ascii)
+    };
+    c.push((ms(last), last_col));
+    c.push((ms(avg), None));
     if wide {
-        c.push((format!("{min}ms"), None));
-        c.push((format!("{max}ms"), None));
-        c.push((sd.to_string(), None));
+        c.push((ms(min), None));
+        c.push((ms(max), None));
+        c.push((
+            if h.samples.is_empty() {
+                "-".into()
+            } else {
+                sd.to_string()
+            },
+            None,
+        ));
     }
-    c.push((format!("{}ms", h.ema), None));
+    c.push((ms(h.ema as u64), None));
     c.push((sparkline(&h.spark, ascii), None));
     c
 }
@@ -1563,6 +1579,23 @@ mod tests {
             ..Hop::default()
         };
         assert_eq!(h.st().4, 0);
+    }
+
+    #[test]
+    fn silent_hop_is_full_loss_with_blank_times() {
+        let h = Hop {
+            sent: 19,
+            ..Hop::default()
+        };
+        assert_eq!(h.st().4, 100);
+        let c: Vec<String> = hop_cells(1, &h, false, true)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(c[2], "100%");
+        assert_eq!(&c[4..7], ["-", "-", "-"]); // last, avg, ema
+                                               // never probed yet: no loss to report
+        assert_eq!(Hop::default().st().4, 0);
     }
 
     #[test]
