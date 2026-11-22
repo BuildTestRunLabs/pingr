@@ -18,6 +18,24 @@ This is a fun side project, not a production tool.
 
 ![Interface details](docs/details.png)
 
+## Install
+
+Static binaries for x86_64 and aarch64 Linux (also runs in WSL2) are on the
+[Releases](https://github.com/BuildTestRunLabs/pingr/releases) page.
+
+```sh
+v=v0.1.0
+arch=x86_64   # or aarch64
+f=pingr-$v-$arch-unknown-linux-musl
+curl -LO https://github.com/BuildTestRunLabs/pingr/releases/download/$v/$f.tar.gz
+curl -LO https://github.com/BuildTestRunLabs/pingr/releases/download/$v/$f.tar.gz.sha256
+sha256sum -c $f.tar.gz.sha256
+tar xzf $f.tar.gz
+sudo install $f/pingr /usr/local/bin/
+```
+
+Or with Cargo: `cargo install --git https://github.com/BuildTestRunLabs/pingr`
+
 ## Build
 
 Needs a stable Rust toolchain and a C linker (`gcc`).
